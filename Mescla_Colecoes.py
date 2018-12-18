@@ -1,15 +1,10 @@
 # Bibliotecas
 import Util
 import re
-import csv
 
-# Temos duas coleções que precisam ser mescladas: ufos.ufo e dbclima.clima
+# Temos duas coleções que precisam ser mescladas: ufo.ufos e dbclima.clima
 # Para cada documento em dbclima.clima, vamos localizar cidade, estado, ano, mes, dia, hora e minuto em ufos.ufo
 # Caso tenhamos um "match", um documento, mais enxuto, será gravado em uma terceira coleção
-# Para os que não foram "casados", ainda existe esperança de fazê-lo no futuro
-
-# Inicia Caixa de Areia, destino das linhas cujos valores (cidade, estado, instante) não constam na base clima
-caixa_de_areia = []
 
 # Conexões
 cliente_MongoDB_ufos = Util.fnc_Conecta_Base_Documentos('', '', 'localhost', '27017', 'ufos')
@@ -18,8 +13,26 @@ db_ufos = cliente_MongoDB_ufos.ufos
 cliente_MongoDB_db_clima = Util.fnc_Conecta_Base_Documentos('', '', 'localhost', '27017', 'dbclima')
 db_clima = cliente_MongoDB_db_clima.dbclima
 
-# Visitando todo documento da coleção de ufos
-for u in db_ufos.ufo.find({}, { "_id" : 0, "City" : 1, "State" : 1, "Shape" : 1,
+# Localiza maior posicao gravada na coleção clima_consolidado
+consulta_ultimo_armazenado = db_clima.clima_consolidado.find_one (sort=[("posicao", -1)])
+ultimo_carregado = 0
+if 'posicao' in consulta_ultimo_armazenado:
+    ultimo_carregado = consulta_ultimo_armazenado['posicao']
+
+# Cria view sobre coleção clima, mas apenas para posições maiores à encontrada
+db_clima.vclima.drop()
+pipeline = [{"$match": { "posicao" : { "$gt" : ultimo_carregado } } }]
+db_clima.command({
+    "create": "vclima",
+    "viewOn": "clima",
+    "pipeline": pipeline
+})
+
+# Cria lista para armazenar _id de UFOs, cujos dados climáticos já foram encontrados
+lista_ufos_encontrados = []
+
+# Visitando todo documento de ufo (não seria necessário explicitar campos)
+for u in db_ufos.ufo.find({}, { "_id" : 1, "City" : 1, "State" : 1, "Shape" : 1,
                                  "Sight_Year" : 1,"Sight_Month" : 1, "Sight_Day" : 1,
                                  "Sight_Time": 1}):
     cidade = u["City"]
@@ -36,8 +49,7 @@ for u in db_ufos.ufo.find({}, { "_id" : 0, "City" : 1, "State" : 1, "Shape" : 1,
     mes = u["Sight_Month"].zfill(2)
     dia = u["Sight_Day"].zfill(2)
     # Esmiuçando "Sight_Time" em: hora e minuto. Exemplo  00:05
-    # Temos que garantir o tamanho 2 para cada item.
-    # Exemplo: se ler dia "8", precisamos transformá-lo em "08"
+    # Temos que garantir o tamanho 2 para cada item. Exemplo: se ler hora "8", precisamos transformá-lo em "08"
     x = re.findall('\d+', u["Sight_Time"]) # Extraímos os 2 números
     hora = x[0].zfill(2)
     #minuto = x[1].zfill(2)
@@ -52,6 +64,7 @@ for u in db_ufos.ufo.find({}, { "_id" : 0, "City" : 1, "State" : 1, "Shape" : 1,
                         #"history.observations.date.min": minuto
                  }},
             {"$project": {"_id": 0,
+                          "posicao" : 1,
                           "history.observations.tempi" : 1,
                           "history.observations.tempm" : 1,
                           "history.observations.dewptm" :1,
@@ -83,44 +96,42 @@ for u in db_ufos.ufo.find({}, { "_id" : 0, "City" : 1, "State" : 1, "Shape" : 1,
                           "history.observations.tornado": 1
                           }}
                     ]
-    busca_medida = db_clima.clima.aggregate(pipeline)
+    busca_medida = db_clima.vclima.aggregate(pipeline)
     medidas = next(busca_medida, None)
-    cabecalho = {
-        'estado': estado,
-        'cidade': cidade,
-        'formato': u["Shape"],
-        'dia': dia,
-        'mes': mes,
-        'ano': ano,
-      #  'hora': hora
-      #  'minuto': minuto
-    }
     if medidas:
-        # Juntando ambas as estruturas (dictionaries):
-        json_para_gravar = {**cabecalho, **medidas}
-        try:
-            # Inserindo documento na coleção "clima"
-            resultado = db_clima.clima_consolidado.insert_one(json_para_gravar)
-            print (cidade, estado, ano, mes, dia)
-        except:
-            print("Provavelmente tentativa de inseção duplicada: ", cidade, estado, ano, mes, dia)
-            caixa_de_areia.append(u)
-    else: #Não achou um registro com cidade/estado e instante. Mas nada impede que no futuro venha a achar
-        print ('Não achou: ', cidade, estado, ano, mes, dia, ' -> Movendo para caixa de areia!')
-        caixa_de_areia.append(estado + "-" + cidade + "-" + dia + "/" + mes + "/" + ano + ":")
-# Descarregando a caixa de areia
-if caixa_de_areia:
-    print ("-----------------------------Descarregando a Caixa de Areia!")
-    f = open('/mnt/c/Users/Henrique/Projetos/ufo-data-science/caixa_de_areia_NUFORC.csv', 'wt')
-    try:
-        writer = csv.writer(f)
-        for i in caixa_de_areia:
-            writer.writerow(i)
-        print("-----------------------------Gerado arquivo caixa_de_areia.csv!")
-    finally:
-        f.close()
-else:
-    print ("-----------------------------Caixa de areia vazia!")
+        # Extrai a posicao:
+        posicao = medidas["posicao"]
+        # Busca posicao em clima_consolidado
+        acha_posicao = db_clima.clima_consolidado.find({"posicao": posicao})
+        if (acha_posicao.count() == 0):  # não achou
+            # Se não achar, monta cabeçalho e procede com gravação
+            cabecalho = {
+                'posicao': posicao,
+                'estado': estado,
+                'cidade': cidade,
+                'formato': u["Shape"],
+                'dia': dia,
+                'mes': mes,
+                'ano': ano,
+                #'hora': hora
+                #  'minuto': minuto
+            }
+            # Juntando ambas as estruturas (dictionaries):
+            json_para_gravar = {**cabecalho, **medidas}
+            try:
+                # Inserindo documento na coleção "clima"
+                resultado = db_clima.clima_consolidado.insert_one(json_para_gravar)
+                lista_ufos_encontrados.append (u["_id"])
+                print (cidade, estado, ano, mes, dia)
+            except:
+                print("Provavelmente tentativa de inseção duplicada: ", cidade, estado, ano, mes, dia)
+        else:
+            print("Documento existente!")
+    else:
+        print ("Não encontrou documento em vclima! ")
+# Elimina na coleção de UFOs os "_id" cujos dados climáticos correspondentes foram encontrados
+for id in lista_ufos_encontrados:
+    db_ufos.ufo.delete_one ({ '_id' : id })
 
 # Fim
 
